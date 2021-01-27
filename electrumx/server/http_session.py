@@ -136,8 +136,8 @@ class HttpHandler(object):
             coro_u = self.get_unconfirmed_list(hashX)
             coro_c = self.get_confirmed_list(hashX)
             unconfirmed_list, confirmed_list = await asyncio.gather(coro_u, coro_c)
-            self.logger.info(f"unconfirmed: {unconfirmed_list}")
-            self.logger.info(f"confirmed: {confirmed_list}")
+            # self.logger.info(f"unconfirmed: {unconfirmed_list}")
+            # self.logger.info(f"confirmed: {confirmed_list}")
             return unconfirmed_list + confirmed_list
         except Exception as error:
             raise error
