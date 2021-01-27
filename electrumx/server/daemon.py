@@ -232,9 +232,6 @@ class Daemon(object):
         '''Update our record of the daemon's mempool hashes.'''
         return await self._send_single('getrawmempool', (True, ))
 
-    async def getrawmempool(self, verbose=False):
-        return await self._send_single('getrawmempool', [verbose])
-
     async def estimatefee(self, block_count):
         '''Return the fee estimate for the block count.  Units are whole
         currency units per KB, e.g. 0.00000995, or -1 if no estimate
@@ -294,14 +291,6 @@ class Daemon(object):
         '''
         params_iterable = ((raw_script,) for raw_script in script_list)
         return await self._send_vector('decodescript', params_iterable, replace_errs=replace_errs)
-
-    async def getdescriptorsinfo(self, descriptors, script_type, replace_errs=True):
-        params_iterable = ([f'{script_type}({descriptor})'] for descriptor in descriptors)
-        return await self._send_vector('getdescriptorinfo', params_iterable, replace_errs=replace_errs)
-    
-    async def getderiveaddresses(self, descriptors, replace_errs=True):
-        params_iterable = ([f'{descriptor}'] for descriptor in descriptors)
-        return await self._send_vector('deriveaddresses', params_iterable, replace_errs=replace_errs)
     
     async def broadcast_transaction(self, raw_tx):
         '''Broadcast a transaction to the network.'''
