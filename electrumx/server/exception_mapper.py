@@ -1,7 +1,6 @@
 import json
 import traceback
 
-
 from aiohttp import web, web_middlewares
 
 
@@ -28,8 +27,7 @@ def error_middleware(self) -> web_middlewares:
                     return json_error(ex.status, ex)
                 raise
             except Exception as e:
-                self.logger.warning('Request {} has failed with exception: {}'.format(request, repr(e)))
-                self.logger.warning(traceback.format_exc())
+                self.logger.error(traceback.format_exc())
                 return json_error(500, e)
 
         return middleware_handler

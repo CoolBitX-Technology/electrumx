@@ -36,7 +36,7 @@ from electrumx.lib.hash import (sha256, hash_to_hex_str, hex_str_to_hash,
 from electrumx.server.daemon import DaemonError
 from electrumx.server.peers import PeerManager
 from aiohttp import web
-from electrumx.server.http_session import HttpHandler
+from electrumx.server.http_session import HttpHandler, logging_middleware
 from electrumx.server.exception_mapper import error_middleware
 
 
@@ -166,7 +166,7 @@ class SessionManager:
             if service.protocol == 'http':
                 host = None if service.host == 'all_interfaces' else str(service.host)
                 try:
-                    app = web.Application(middlewares=[error_middleware(self)])
+                    app = web.Application(middlewares=[error_middleware(self), logging_middleware(self)])
                     handler = HttpHandler(self, self.db, self.mempool, self.peer_mgr, kind)
                     app.router.add_get('/utils/estimatefee', handler.estimatefee)
                     app.router.add_post('/tx/send', handler.send_transaction)

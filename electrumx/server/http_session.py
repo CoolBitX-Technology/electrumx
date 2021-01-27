@@ -1,6 +1,5 @@
 import json
-from aiohttp import web
-from aiorpcx import RPCError
+from aiohttp import web, web_middlewares
 from functools import reduce
 from decimal import Decimal
 from electrumx.lib.hash import hash_to_hex_str
@@ -102,13 +101,13 @@ class HttpHandler(object):
         # check pagination
         if query_from < 0:
             return web.Response(status=400,
-                text='query value "from" must be greater than or equal to 0')
+                text="query value 'from' must be greater than or equal to 0")
         if query_to < 0:
             return web.Response(status=400,
-                text='query value "to" must be greater than or equal to 0')
+                text="query value 'to' must be greater than or equal to 0")
         if query_from > query_to:
             return web.Response(status=400,
-                text='query value "from" must be less than query value "to"')
+                text="query value 'from' must be less than query value 'to'")
 
         if query_to > query_from + MAX_TX_QUERY:
             query_to = query_from + MAX_TX_QUERY
@@ -168,6 +167,8 @@ class HttpHandler(object):
                 tx_time = tx_detail.get('time')
             else:
                 # This is unconfirmed transaction, so get the time from memory pool
+                # In the past, we always fetch the full detail of mempool everytime we just want the time of an unconfirmed tx,
+                # which is inefficient. Currently, we maintain a global copy of mempool detail that refreshes every 5 secs.
                 txid = tx_detail.get('txid')
                 async with self.mempool.data_lock:
                     memtx = self.mempool.detail.get(txid)
@@ -279,7 +280,7 @@ class HttpHandler(object):
             return self.coin.address_to_hashX(address)
         except Exception:
             pass
-        raise RPCError(BAD_REQUEST, f'{address} is not a valid address')
+        raise Exception(f'{address} is not a valid address')
 
     async def address_get_balance(self, address):
         '''Return the confirmed and unconfirmed balance of an address.'''
@@ -293,14 +294,14 @@ class HttpHandler(object):
         return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
 
     def assert_tx_hash(self, value):
-        '''Raise an RPCError if the value is not a valid transaction
+        '''Raise an Exception if the value is not a valid transaction
         hash.'''
         try:
             if len(util.hex_to_bytes(value)) == 32:
                 return
         except Exception:
             pass
-        raise RPCError(BAD_REQUEST, f'{value} should be a transaction hash')
+        raise Exception(f'{value} should be a transaction hash')
 
     async def hashX_listunspent(self, hashX):
         '''Return the list of UTXOs of a script hash, including mempool
@@ -324,7 +325,7 @@ class HttpHandler(object):
         '''
         self.assert_tx_hash(tx_hash)
         if verbose not in (True, False):
-            raise RPCError(BAD_REQUEST, f'"verbose" must be a boolean')
+            raise Exception(f'"verbose" must be a boolean')
 
         return await self.daemon_request('getrawtransaction', tx_hash, verbose)
 
@@ -349,3 +350,20 @@ class DecimalEncoder(json.JSONEncoder):
         if isinstance(o, Decimal):
             return float(o)
         return super(DecimalEncoder, self).default(o)
+
+def logging_middleware(self) -> web_middlewares:
+    async def factory(app: web.Application, handler):
+        async def middleware_handler(request):
+            try:
+                response = await handler(request)
+                if 200 <= response.status and response.status < 300:
+                    self.logger.info(f"[{response.status}] {request.method} {request.path}")
+                else:
+                    self.logger.error(f'[{response.status}] {request.method} {request.path} "{response.text}"')
+                return response
+            except Exception as error:
+                self.logger.error(f'[500] {request.method} {request.path} "{error}"')
+                raise error
+
+        return middleware_handler
+    return factory
