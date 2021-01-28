@@ -86,7 +86,7 @@ class HttpHandler(object):
     async def history(self, request):
         '''
         The history api will first get all txIDs associated with the address given,
-        then it will process the detail corresponds to each txID to retrieve the final output.
+        then will process the detail corresponds to each txID to retrieve the final output.
         '''
         # path variable
         addrs = request.match_info.get('addrs', None)
@@ -167,8 +167,9 @@ class HttpHandler(object):
                 tx_time = tx_detail.get('time')
             else:
                 # This is unconfirmed transaction, so get the time from memory pool
-                # In the past, we always fetch the full detail of mempool everytime we just want the time of an unconfirmed tx,
-                # which is inefficient. Currently, we maintain a global copy of mempool detail that refreshes every 5 secs.
+                # In the past, we always fetch the full detail of mempool everytime 
+                # when we just want the timestamp of an unconfirmed tx, which is inefficient. 
+                # Currently, we maintain a global copy of mempool detail that refreshes every 5 secs.
                 txid = tx_detail.get('txid')
                 async with self.mempool.data_lock:
                     memtx = self.mempool.detail.get(txid)
@@ -192,12 +193,12 @@ class HttpHandler(object):
                 prev_out_script_list = [ bytes(out.pk_script).hex() for out in prev_out_list ]
                 script_detail_list = await self.get_script_detail_list(prev_out_script_list)
 
-                # check prev output script type and retrieve addresses
+                # check the type of prev output script and retrieve address list
                 vin_addrs_list = self.get_addrs_from_script_list(script_detail_list)
 
                 final_vin_list = []
                 for txid, addrs, value in zip(vin_txid_list, vin_addrs_list, prev_out_value_list):
-                    if addrs: # addr list indicates a valid transaction
+                    if addrs: # non-null address indicates a typical transaction
                         final_vin_list.append({ 'txid': txid, 'addrs': addrs, 'value': value })
 
                 final_vout_list = []
@@ -205,7 +206,7 @@ class HttpHandler(object):
                 vout_script_list = [ out.get('scriptPubKey') for out in tx_detail.get('vout') ]
                 vout_addrs_list = self.get_addrs_from_script_list(vout_script_list)
                 for addrs, value in zip(vout_addrs_list, vout_value_list):
-                    if addrs: # addr list indicates a valid transaction
+                    if addrs: # non-null address indicates a typical transaction
                         final_vout_list.append({'addrs': addrs, 'value': value})
 
                 # total input/output amount
