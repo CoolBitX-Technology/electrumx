@@ -89,44 +89,47 @@ class HttpHandler(object):
         then will process the detail corresponds to each txID to retrieve the final output.
         '''
         # path variable
-        addrs = request.match_info.get('addrs', None)
-        if addrs is None:
+        addrs = request.match_info.get('addrs')
+        if not addrs:
             return web.Response(status=404)
 
-        # query string
-        query = request.rel_url.query
-        query_from = util.parse_int(query['from'], 0)
-        query_to = util.parse_int(query['to'], MAX_TX_QUERY)
+        try:
+            query_from = int(request.query.get('from'))
+            query_to = int(request.query.get('to'))
 
-        # check pagination
-        if query_from < 0:
-            return web.Response(status=400,
-                text="query value 'from' must be greater than or equal to 0")
-        if query_to < 0:
-            return web.Response(status=400,
-                text="query value 'to' must be greater than or equal to 0")
-        if query_from > query_to:
-            return web.Response(status=400,
-                text="query value 'from' must be less than query value 'to'")
+            assert query_from >= 0, "'from' is required and must be no less than 0"
+            assert query_to >= 0, "'to' is required and must be no less than 0"
+            assert query_from < query_to, "'from' must be smaller than 'to'"
+            assert query_to - query_from <= 50, "not allowed to query more than 50 txs"
 
-        if query_to > query_from + MAX_TX_QUERY:
-            query_to = query_from + MAX_TX_QUERY
+        except Exception as error:
+            return web.Response(status=400, text=f"Invalid arguments: {str(error)}")
 
         async def get_single_address_history(self, addr: str):
             try:
                 txid_list = await self.get_txid_list(addr)
+                assert txid_list
+
                 # do pagination beforehand
                 tx_detail_list = await self.get_tx_detail_list(txid_list[query_from:query_to])
+                assert tx_detail_list
+
                 history = await self.history_factory(tx_detail_list)
-                history.sort(key=lambda tx: tx.get('time'), reverse=True)
+                assert history
+
+                history.sort(key=lambda tx: tx.get('time', 0), reverse=True)
                 return { 'addr': addr, 'txs': history }
+
             except Exception as error:
                 raise error
             
         try:
             results = await asyncio.gather(*[ get_single_address_history(self, addr) for addr in addrs.split(',') ])
+            assert results
+
             jsonStr = json.dumps(results, cls=DecimalEncoder)
             return web.json_response(json.loads(jsonStr))
+
         except Exception as error:
             raise error
 
@@ -159,70 +162,79 @@ class HttpHandler(object):
     async def history_factory(self, tx_detail_list):
 
         async def process_single_tx_record(self, tx_detail):
-            if not tx_detail:
-                raise Exception('missing transaction detail')
+            
+            assert tx_detail
+            _txid = tx_detail.get('txid'); assert _txid
+            _vin  = tx_detail.get('vin');  assert _vin
+            _vout = tx_detail.get('vout'); assert _vout
+            _confirmations = tx_detail.get('confirmations', 0) # no assertion
 
             # get transaction time
-            if tx_detail.get('confirmations') is not None:
+            if _confirmations > 0: # confirmed tx
                 tx_time = tx_detail.get('time')
             else:
-                # This is unconfirmed transaction, so get the time from memory pool
+                # This is an unconfirmed tx, so get the time from memory pool
                 # In the past, we always fetch the full detail of mempool everytime 
                 # when we just want the timestamp of an unconfirmed tx, which is inefficient. 
                 # Currently, we maintain a global copy of mempool detail that refreshes every 5 secs.
-                txid = tx_detail.get('txid')
                 async with self.mempool.data_lock:
-                    memtx = self.mempool.detail.get(txid)
-                if memtx:
-                    tx_time = memtx.get('time')
-
-            if tx_time is None:
-                raise Exception('cannot get the transaction time')
+                    memtx = self.mempool.detail.get(_txid)
+                    assert memtx
+                tx_time = memtx.get('time')
 
             try:
-                # process vin to get values & addresses
-                vin_txid_list = [ i.get('txid') for i in tx_detail.get('vin') ]
-                vin_idx_list = [ i.get('vout') for i in tx_detail.get('vin') ]
-                vin_raw_list = await self.get_tx_raw_list(vin_txid_list)
-                vin_tx_list = [ self.coin.DESERIALIZER(bytes).read_tx() for bytes in vin_raw_list ]
-
-                # decode prev output script
-                prev_out_list = [ tx.outputs[n] for tx, n in zip(vin_tx_list, vin_idx_list) ]
-                prev_out_value_list = [ out.value / self.coin.VALUE_PER_COIN for out in prev_out_list ]
-                # covert bytes to hex string to allow further json encoding
-                prev_out_script_list = [ bytes(out.pk_script).hex() for out in prev_out_list ]
-                script_detail_list = await self.get_script_detail_list(prev_out_script_list)
-
-                # check the type of prev output script and retrieve address list
-                vin_addrs_list = self.get_addrs_from_script_list(script_detail_list)
-
-                final_vin_list = []
-                for txid, addrs, value in zip(vin_txid_list, vin_addrs_list, prev_out_value_list):
-                    if addrs: # non-null address indicates a typical transaction
-                        final_vin_list.append({ 'txid': txid, 'addrs': addrs, 'value': value })
-
-                final_vout_list = []
-                vout_value_list = [ out.get('value') for out in tx_detail.get('vout') ]
-                vout_script_list = [ out.get('scriptPubKey') for out in tx_detail.get('vout') ]
+                # process vout first
+                final_vout = []
+                vout_value_list = [ out.get('value') for out in _vout ]
+                vout_script_list = [ out.get('scriptPubKey') for out in _vout ]
                 vout_addrs_list = self.get_addrs_from_script_list(vout_script_list)
                 for addrs, value in zip(vout_addrs_list, vout_value_list):
                     if addrs: # non-null address indicates a typical transaction
-                        final_vout_list.append({'addrs': addrs, 'value': value})
+                        final_vout.append({'addrs': addrs, 'value': value})
 
-                # total input/output amount
-                value_in = round(Decimal(reduce(lambda sum, x: sum + x["value"], final_vin_list, 0)), self.prec)
-                value_out = round(Decimal(reduce(lambda sum, x: sum + x["value"], final_vout_list, 0)), self.prec)
+                # total output amount
+                value_out = round(Decimal(reduce(lambda sum, x: sum + x["value"], final_vout, 0)), self.prec)
+
+                final_vin = []
+                if _vin[0].get('coinbase'):
+                    # the input that implied miner's reward from the blockchain
+                    final_vin.append({ 'txid': None, 'addrs': ['coinbase'], 'value': value_out })
+                else:
+                    # process vin to get values & addresses
+                    vin_txid_list = [ i.get('txid') for i in _vin ]
+                    vin_idx_list = [ i.get('vout') for i in _vin ]
+                    vin_raw_list = await self.get_tx_raw_list(vin_txid_list)
+                    vin_tx_list = [ self.coin.DESERIALIZER(tx_bytes).read_tx() if tx_bytes else None for tx_bytes in vin_raw_list ]
+
+                    # decode prev output script
+                    prev_out_list = [ tx.outputs[n] if tx else None for tx, n in zip(vin_tx_list, vin_idx_list) ]
+                    prev_out_value_list = [ out.value / self.coin.VALUE_PER_COIN if out else None for out in prev_out_list ]
+
+                    # covert bytes to hex string to allow further json encoding
+                    prev_out_script_list = [ bytes(out.pk_script).hex() if out else None for out in prev_out_list ]
+                    script_detail_list = await self.get_script_detail_list(prev_out_script_list)
+
+                    # check the type of prev output script and retrieve address list
+                    vin_addrs_list = self.get_addrs_from_script_list(script_detail_list)
+
+                    for txid, addrs, value in zip(vin_txid_list, vin_addrs_list, prev_out_value_list):
+                        if addrs: # non-null address indicates a typical transaction
+                            final_vin.append({ 'txid': txid, 'addrs': addrs, 'value': value })
+
+                # total input amount
+                value_in = round(Decimal(reduce(lambda sum, x: sum + x["value"], final_vin, 0)), self.prec)
 
                 return {
-                    "txid": tx_detail.get('txid'),
-                    "vin": final_vin_list,
-                    "vout": final_vout_list,
-                    "valueOut": value_out,
-                    "valueIn": value_in,
+                    "txid": _txid,
+                    "vin": final_vin,
+                    "vout": final_vout,
+                    "totalOut": value_out,
+                    "totalIn": value_in,
                     "fees": round(value_in-value_out, self.prec),
-                    "confirmations": tx_detail.get('confirmations', 0),
+                    "confirmations": _confirmations,
                     "time": tx_time
                 }
+
             except Exception as error:
                 raise error
 
@@ -332,15 +344,9 @@ class HttpHandler(object):
 
     # new daemon calls
     async def get_tx_raw_list(self, txid_list):
-        for txid in txid_list:
-            if not(txid and isinstance(txid, str) and len(txid)==64):
-                raise Exception('invalid format of txid as argument')
         return await self.daemon_request('getrawtransactions', txid_list)
 
     async def get_tx_detail_list(self, txid_list):
-        for txid in txid_list:
-            if not(txid and isinstance(txid, str) and len(txid)==64):
-                raise Exception('invalid format of txid as argument')
         return await self.daemon_request('getdetailedtransactions', txid_list)
 
     async def get_script_detail_list(self, script_list):
