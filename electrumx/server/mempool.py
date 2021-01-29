@@ -108,11 +108,13 @@ class MemPool(object):
         self.logger = class_logger(__name__, self.__class__.__name__)
         self.txs = {}
         self.hashXs = defaultdict(set)  # None can be a key
+        self.detail = defaultdict(set)
         self.cached_compact_histogram = []
         self.refresh_secs = refresh_secs
         self.log_status_secs = log_status_secs
         # Prevents mempool refreshes during fee histogram calculation
         self.lock = Lock()
+        self.data_lock = Lock()
 
     async def _logging(self, synchronized_event):
         '''Print regular logs of mempool stats.'''
@@ -216,6 +218,8 @@ class MemPool(object):
         while True:
             height = self.api.cached_height()
             hex_hashes = await self.api.mempool_hashes()
+            async with self.data_lock:
+                self.detail = hex_hashes
             if height != await self.api.height():
                 continue
             hashes = set(hex_str_to_hash(hh) for hh in hex_hashes)

@@ -1,6 +1,5 @@
 import json
-from aiohttp import web
-from aiorpcx import RPCError
+from aiohttp import web, web_middlewares
 from functools import reduce
 from decimal import Decimal
 from electrumx.lib.hash import hash_to_hex_str
@@ -86,135 +85,178 @@ class HttpHandler(object):
 
     async def history(self, request):
         '''
-        The history api requries two step of querying to meet our use case.
-        The first step is to get pairs of tx_hash and block_height as history provided by electrumx.
-        The second step is to ask coin core for transaction details.
+        The history api will first get all txIDs associated with the address given,
+        then will process the detail corresponds to each txID to retrieve the final output.
         '''
         # path variable
-        addrs = request.match_info.get('addrs', '')
+        addrs = request.match_info.get('addrs')
         if not addrs:
             return web.Response(status=404)
-        
-        # query string
-        query = request.rel_url.query
-        query_from = util.parse_int(query['from'], 0)
-        query_to   = util.parse_int(query['to'], MAX_TX_QUERY)
-        
-        if query_from < 0:
-            return web.Response(
-                status=400,
-                text=f'Invalid parameter: "from" must be greater than or equal to 0')
 
-        if query_to < 0:
-            return web.Response(
-                status=400,
-                text=f'Invalid parameter: "to" must be greater than or equal to 0')
+        try:
+            query_from = int(request.query.get('from'))
+            query_to = int(request.query.get('to'))
 
-        if query_from > query_to:
-            return web.Response(
-                status=400,
-                text=f'Invalid parameter: "from" must be less than "to"')
+            assert query_from >= 0, "'from' is required and must be no less than 0"
+            assert query_to >= 0, "'to' is required and must be no less than 0"
+            assert query_from < query_to, "'from' must be smaller than 'to'"
+            assert query_to - query_from <= 50, "not allowed to query more than 50 txs"
 
-        if query_to > query_from + MAX_TX_QUERY:
-            query_to = query_from + MAX_TX_QUERY
+        except Exception as error:
+            return web.Response(status=400, text=f"Invalid arguments: {str(error)}")
 
-        tasks_fetch_tuples = []
-        for addr in addrs.split(','):
-            # query electrumx history db
-            tasks_fetch_tuples.append(self.get_history(addr))
+        async def get_single_address_history(self, addr: str):
+            try:
+                txid_list = await self.get_txid_list(addr)
+                assert txid_list
+
+                # do pagination beforehand
+                tx_detail_list = await self.get_tx_detail_list(txid_list[query_from:query_to])
+                assert tx_detail_list
+
+                history = await self.history_factory(tx_detail_list)
+                assert history
+
+                history.sort(key=lambda tx: tx.get('time', 0), reverse=True)
+                return { 'addr': addr, 'txs': history }
+
+            except Exception as error:
+                raise error
             
-        list_history_by_address = await asyncio.gather(*tasks_fetch_tuples)
-        list_joined_history = [ entry for per_address in list_history_by_address for entry in per_address ]
-        
-        max_height = max([ entry['height'] for entry in list_joined_history ])
-        # sort history by block height and pop unconfirmed history to the top
-        list_joined_history.sort(key=lambda x: x['height'] if x['height']!=0 else max_height+1, reverse=True)
-        
-        tx_hashes = [ entry["tx_hash"] for entry in list_joined_history[query_from:query_to] ]
+        try:
+            results = await asyncio.gather(*[ get_single_address_history(self, addr) for addr in addrs.split(',') ])
+            assert results
 
-        tasks_fetch_data = []
-        for hash in tx_hashes:
-            tasks_fetch_data.append(self.transaction_get_detail(hash))
+            jsonStr = json.dumps(results, cls=DecimalEncoder)
+            return web.json_response(json.loads(jsonStr))
+
+        except Exception as error:
+            raise error
+
+    async def get_txid_list(self, addr):
+        try:
+            hashX = self.address_to_hashX(addr)
+            coro_u = self.get_unconfirmed_list(hashX)
+            coro_c = self.get_confirmed_list(hashX)
+            unconfirmed_list, confirmed_list = await asyncio.gather(coro_u, coro_c)
+            # self.logger.info(f"unconfirmed: {unconfirmed_list}")
+            # self.logger.info(f"confirmed: {confirmed_list}")
+            return unconfirmed_list + confirmed_list
+        except Exception as error:
+            raise error
+
+    async def get_unconfirmed_list(self, hashX):
+        try:
+            unconfirmed_list = await self.mempool.transaction_summaries(hashX)
+            return [ hash_to_hex_str(tx.hash) for tx in unconfirmed_list ]
+        except Exception as error:
+            raise error
+
+    async def get_confirmed_list(self, hashX):
+        try:
+            confirmed_list = await self.session_mgr.history(hashX)
+            return [ hash_to_hex_str(tx_hash) for tx_hash, height in list(reversed(confirmed_list)) ]
+        except Exception as error:
+            raise error
+
+    async def history_factory(self, tx_detail_list):
+
+        async def process_single_tx_record(self, tx_detail):
             
-        tx_details = await asyncio.gather(*tasks_fetch_data)
-        
-        task_hist = []
-        for hist, tx in zip(list_joined_history[query_from:query_to], tx_details):
-            task_hist.append(self.history_factory(hist['height'], tx))
-            
-        list_history = await asyncio.gather(*task_hist)
-        
-        response = {
-            "totalItems": len(list_joined_history),
-            "items": list_history,
-        }
-                
-        jsonStr = json.dumps(response, cls=DecimalEncoder)        
-        return web.json_response(json.loads(jsonStr))
+            assert tx_detail
+            _txid = tx_detail.get('txid'); assert _txid
+            _vin  = tx_detail.get('vin');  assert _vin
+            _vout = tx_detail.get('vout'); assert _vout
+            _confirmations = tx_detail.get('confirmations', 0) # no assertion
 
-    async def history_factory(self, height, tx):
-                
-        if tx is None:
-            return None
-        
-        if 'time' in tx:
-            time = tx["time"]
-        else:
-            # This is unconfirmed transaction, so get the time from memory pool
-            # The time the transaction entered the memory pool, Unix epoch time format
-            mempool = await self.mempool_get(True)
-            tx = mempool.get(tx["txid"])
-            time = tx.get('time') if tx is not None else None
-                             
-        if time is None:
-            raise RPCError(BAD_REQUEST, f'cannot get the transaction\'s time')
-        
-        vin = tx["vin"]
-        vin_n = [ v.get('vout') for v in tx["vin"] ]
-        vin_hashes = [ v.get('txid') for v in tx["vin"] ]
+            # get transaction time
+            if _confirmations > 0: # confirmed tx
+                tx_time = tx_detail.get('time')
+            else:
+                # This is an unconfirmed tx, so get the time from memory pool
+                # In the past, we always fetch the full detail of mempool everytime 
+                # when we just want the timestamp of an unconfirmed tx, which is inefficient. 
+                # Currently, we maintain a global copy of mempool detail that refreshes every 5 secs.
+                async with self.mempool.data_lock:
+                    memtx = self.mempool.detail.get(_txid)
+                    assert memtx
+                tx_time = memtx.get('time')
 
-        vin_details = []
-        list_vin_bytes = await self.transaction_get_multiple(vin_hashes)
-        for bytes in list_vin_bytes:
-            # decode hashed transaction data
-            vin_details.append(self.coin.DESERIALIZER(bytes).read_tx())
-        
-        prev_outs = []
-        for i, d in enumerate(vin_details):
-            # extract specific output from input transaction detail
-            if d is not None: prev_outs.append(d.outputs[vin_n[i]])
-            else: prev_outs.append(None)
-        
-        # convert hex bytes to text string
-        list_pk_script = [ codecs.encode(o.pk_script, 'hex').decode('ascii') for o in prev_outs ]
-        list_descriptor_info = await self.descriptorinfo_get_multiple(list_pk_script, 'raw')
-                
-        list_descriptor = [ info['descriptor'] for info in list_descriptor_info ]
-        list_address = await self.address_get_multiple(list_descriptor)
-        
-        for i in range(len(vin)):
-            if 'txid' in vin[i]:
-                vin[i] = {
-                    "txid": vin[i]["txid"],
-                    "addr": list_address[i][0],
-                    #"valueSat": prev_outs[i].value,
-                    "value": prev_outs[i].value / self.coin.VALUE_PER_COIN,
+            try:
+                # process vout first
+                final_vout = []
+                vout_value_list = [ out.get('value') for out in _vout ]
+                vout_script_list = [ out.get('scriptPubKey') for out in _vout ]
+                vout_addrs_list = self.get_addrs_from_script_list(vout_script_list)
+                for addrs, value in zip(vout_addrs_list, vout_value_list):
+                    if addrs: # non-null address indicates a typical transaction
+                        final_vout.append({'addrs': addrs, 'value': value})
+
+                # total output amount
+                value_out = round(Decimal(reduce(lambda sum, x: sum + x["value"], final_vout, 0)), self.prec)
+
+                final_vin = []
+                if _vin[0].get('coinbase'):
+                    # the input that implied miner's reward from the blockchain
+                    final_vin.append({ 'txid': None, 'addrs': ['coinbase'], 'value': value_out })
+                else:
+                    # process vin to get values & addresses
+                    vin_txid_list = [ i.get('txid') for i in _vin ]
+                    vin_idx_list = [ i.get('vout') for i in _vin ]
+                    vin_raw_list = await self.get_tx_raw_list(vin_txid_list)
+                    vin_tx_list = [ self.coin.DESERIALIZER(tx_bytes).read_tx() if tx_bytes else None for tx_bytes in vin_raw_list ]
+
+                    # decode prev output script
+                    prev_out_list = [ tx.outputs[n] if tx else None for tx, n in zip(vin_tx_list, vin_idx_list) ]
+                    prev_out_value_list = [ out.value / self.coin.VALUE_PER_COIN if out else None for out in prev_out_list ]
+
+                    # covert bytes to hex string to allow further json encoding
+                    prev_out_script_list = [ bytes(out.pk_script).hex() if out else None for out in prev_out_list ]
+                    script_detail_list = await self.get_script_detail_list(prev_out_script_list)
+
+                    # check the type of prev output script and retrieve address list
+                    vin_addrs_list = self.get_addrs_from_script_list(script_detail_list)
+
+                    for txid, addrs, value in zip(vin_txid_list, vin_addrs_list, prev_out_value_list):
+                        if addrs: # non-null address indicates a typical transaction
+                            final_vin.append({ 'txid': txid, 'addrs': addrs, 'value': value })
+
+                # total input amount
+                value_in = round(Decimal(reduce(lambda sum, x: sum + x["value"], final_vin, 0)), self.prec)
+
+                return {
+                    "txid": _txid,
+                    "vin": final_vin,
+                    "vout": final_vout,
+                    "totalOut": value_out,
+                    "totalIn": value_in,
+                    "fees": round(value_in-value_out, self.prec),
+                    "confirmations": _confirmations,
+                    "time": tx_time
                 }
 
-        vout = tx["vout"]
-        value_in = round(Decimal(str(reduce(lambda sum, x: sum + x["value"], vin, 0))), self.prec)
-        value_out = round(Decimal(str(reduce(lambda sum, x: sum + x["value"], vout, 0))), self.prec)
-        
-        return {
-            "txid": tx["txid"],
-            "blockheight": height,
-            "vin": vin,
-            "vout": vout,
-            "valueOut": value_out,
-            "valueIn": value_in,
-            "fees": value_in - value_out,
-            "confirmations": tx["confirmations"] if 'confirmations' in tx else 0,
-            "time": time}
+            except Exception as error:
+                raise error
+
+        return await asyncio.gather(*[ process_single_tx_record(self, tx_detail) for tx_detail in tx_detail_list ])
+
+    def get_addrs_from_script_list(self, script_list):
+        addrs_list = []
+        for s in script_list:
+            if not s:
+                addrs_list.append(None)
+                continue
+            if s.get('addresses'):
+                addrs_list.append(s.get('addresses'))
+                continue
+            elif s.get('type') == 'nonstandard':
+                # might be segwit transaction
+                segwit = s.get('segwit')
+                if segwit and segwit.get('addresses'):
+                    addrs_list.append(segwit.get('addresses'))
+                    continue
+            addrs_list.append(None)
+        return addrs_list
 
     async def wallet_unspent(self, address, utxo, tx_detail):
         height = utxo["height"]
@@ -235,7 +277,8 @@ class HttpHandler(object):
             amount = obj["value"]
             script_pub_key = obj["scriptPubKey"]["hex"]
         else:
-            raise Exception(f'cannot get the transaction\'s list of outputs from address:{address}')
+            raise Exception(
+                f'cannot get the transaction\'s list of outputs from address:{address}')
         return {"address": address,
                 "txid": tx_detail["txid"],
                 "vout": vout,
@@ -250,23 +293,12 @@ class HttpHandler(object):
             return self.coin.address_to_hashX(address)
         except Exception:
             pass
-        raise RPCError(BAD_REQUEST, f'{address} is not a valid address')
+        raise Exception(f'{address} is not a valid address')
 
     async def address_get_balance(self, address):
         '''Return the confirmed and unconfirmed balance of an address.'''
         hashX = self.address_to_hashX(address)
         return await self.get_balance(hashX)
-
-    async def get_history(self, address):
-        '''Return the confirmed and unconfirmed history of an address.'''
-        hashX = self.address_to_hashX(address)
-        
-        uth = await asyncio.create_task(self.unconfirmed_history(hashX))        
-        cth = await asyncio.create_task(self.session_mgr.history(hashX)) # list of tuple
-        cth = [{'height': height, 'tx_hash': hash_to_hex_str(tx_hash)} for tx_hash, height in cth ]
-        # cth.reverse() # make the result identical to the original one
-
-        return uth + cth
 
     async def get_balance(self, hashX):
         utxos = await self.db.all_utxos(hashX)
@@ -274,32 +306,15 @@ class HttpHandler(object):
         unconfirmed = await self.mempool.balance_delta(hashX)
         return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
 
-    async def unconfirmed_history(self, hashX):
-        # Note unconfirmed history is unordered in electrum-server
-        # height is -1 if it has unconfirmed inputs, otherwise 0
-        return [{
-            'fee': tx.fee,
-            'tx_hash': hash_to_hex_str(tx.hash),
-            'height': -tx.has_unconfirmed_inputs,
-        } for tx in await self.mempool.transaction_summaries(hashX)]
-
-    async def confirmed_and_unconfirmed_history(self, hashX):
-        '''latest in the blockchain first.'''
-        # Note history is ordered but unconfirmed is unordered in e-s
-        history = await self.session_mgr.history(hashX)
-        conf = [{'tx_hash': hash_to_hex_str(tx_hash), 'height': height}
-                for tx_hash, height in history]
-        return await self.unconfirmed_history(hashX) + list(reversed(conf))
-
     def assert_tx_hash(self, value):
-        '''Raise an RPCError if the value is not a valid transaction
+        '''Raise an Exception if the value is not a valid transaction
         hash.'''
         try:
             if len(util.hex_to_bytes(value)) == 32:
                 return
         except Exception:
             pass
-        raise RPCError(BAD_REQUEST, f'{value} should be a transaction hash')
+        raise Exception(f'{value} should be a transaction hash')
 
     async def hashX_listunspent(self, hashX):
         '''Return the list of UTXOs of a script hash, including mempool
@@ -323,51 +338,19 @@ class HttpHandler(object):
         '''
         self.assert_tx_hash(tx_hash)
         if verbose not in (True, False):
-            raise RPCError(BAD_REQUEST, f'"verbose" must be a boolean')
+            raise Exception(f'"verbose" must be a boolean')
 
         return await self.daemon_request('getrawtransaction', tx_hash, verbose)
-    
-    async def transaction_get_detail(self, tx_hash):
-        '''
-        Return the serialized raw transaction given its hash\n
-        tx_hash: the transaction hash as a hexadecimal string
-        verbose: passed on to the daemon
-        '''
-        self.assert_tx_hash(tx_hash)
-        return await self.daemon_request('getrawtransaction', tx_hash, True)
-    
-    async def transaction_get_multiple(self, tx_hashes):
-        '''
-        Return the a bunch of serialized raw transaction given hash values\n
-        tx_hashes: list of transaction hash;
-        verbose: passed on to the daemon;
-        '''
-        return await self.daemon_request('getrawtransactions', tx_hashes)
-    
-    async def transaction_get_multiple_details(self, tx_hashes):
-        '''
-        Return the a bunch of serialized raw transaction given hash values\n
-        tx_hashes: list of transaction hash;
-        verbose: passed on to the daemon;
-        '''
-        return await self.daemon_request('getdetailedtransactions', tx_hashes)
 
-    async def descriptorinfo_get_multiple(self, descriptors, script_type):
-        return await self.daemon_request('getdescriptorsinfo', descriptors, script_type)
-        
-    async def address_get_multiple(self, descriptors):
-        return await self.daemon_request('getderiveaddresses', descriptors)
-    
-    async def mempool_get(self, verbose=False):
-        '''Returns all transaction ids in memory pool as a json array of string transaction ids
+    # new daemon calls
+    async def get_tx_raw_list(self, txid_list):
+        return await self.daemon_request('getrawtransactions', txid_list)
 
-        verbose: True for a json object, false for array of transaction ids
-        '''
-        if verbose not in (True, False):
-            raise RPCError(BAD_REQUEST, f'"verbose" must be a boolean')
+    async def get_tx_detail_list(self, txid_list):
+        return await self.daemon_request('getdetailedtransactions', txid_list)
 
-        return await self.daemon_request('getrawmempool', verbose)
-
+    async def get_script_detail_list(self, script_list):
+        return await self.daemon_request('decode_scripts', script_list)
 
 class DecimalEncoder(json.JSONEncoder):
     def default(self, o):
@@ -375,3 +358,19 @@ class DecimalEncoder(json.JSONEncoder):
             return float(o)
         return super(DecimalEncoder, self).default(o)
 
+def logging_middleware(self) -> web_middlewares:
+    async def factory(app: web.Application, handler):
+        async def middleware_handler(request):
+            try:
+                response = await handler(request)
+                if 200 <= response.status and response.status < 300:
+                    self.logger.info(f"[{response.status}] {request.method} {request.path}")
+                else:
+                    self.logger.error(f'[{response.status}] {request.method} {request.path} "{response.text}"')
+                return response
+            except Exception as error:
+                self.logger.error(f'[500] {request.method} {request.path} "{error}"')
+                raise error
+
+        return middleware_handler
+    return factory
